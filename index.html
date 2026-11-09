@@ -55,7 +55,7 @@
     <button id="fsBtn">Pełny ekran</button>
     <button id="refreshBtn">Odśwież listę</button>
   </div>
-  <div class="hint">Dwuklik na obrazie = pełny ekran. Panel chowa się sam po 3 s bez ruchu myszy.</div>
+  <div class="hint">Po połączeniu panel się chowa – Spacja lub Esc pokazuje / chowa go. Dwuklik na obrazie = pełny ekran (w pełnym ekranie Esc najpierw z niego wychodzi).</div>
   <div id="log"></div>
 </div>
 
@@ -78,6 +78,7 @@ function log(msg, cls) {
   $('log').appendChild(line);
   $('log').scrollTop = 1e9;
   (cls === 'err' ? console.error : console.log)(msg);
+  if (cls === 'err') setPanel(true);
 }
 
 const idOf = label => (label.match(/\(([0-9a-f]{4}:[0-9a-f]{4})\)\s*$/i) || [])[1]?.toLowerCase();
@@ -246,8 +247,10 @@ async function start() {
         '\nCzy karty nie używa inny program (OBS, Kamera, Discord)? Spróbuj innego portu USB lub trybu 25 FPS.', 'err');
     return;
   }
+  let audioOk = true;
   try { await startAudio(aId); }
-  catch (e) { log('Nie udało się uruchomić dźwięku: ' + e.name + ' ' + (e.message || ''), 'err'); }
+  catch (e) { audioOk = false; log('Nie udało się uruchomić dźwięku: ' + e.name + ' ' + (e.message || ''), 'err'); }
+  if (audioOk && isRunning()) setPanel(false);
 }
 
 $('startBtn').onclick = start;
@@ -277,18 +280,31 @@ setInterval(() => {
   lastFrames = n;
 }, 1000);
 
-// auto-hide panel and cursor
-let hideT;
-function poke() {
-  $('panel').classList.remove('hidden');
-  document.body.style.cursor = '';
-  clearTimeout(hideT);
-  hideT = setTimeout(() => {
-    if (video.srcObject && !$('panel').matches(':hover')) { $('panel').classList.add('hidden'); document.body.style.cursor = 'none'; }
-  }, 3000);
+// Panel: visible until connected, then toggled only with Space / Esc (not by the mouse).
+// It also pops up by itself when an error is logged.
+function setPanel(show) {
+  $('panel').classList.toggle('hidden', !show);
+  if (!show && document.activeElement) document.activeElement.blur(); // so Space doesn't press a button
+  document.body.style.cursor = show ? '' : 'none';
 }
-addEventListener('mousemove', poke);
-addEventListener('keydown', poke);
+addEventListener('keydown', e => {
+  if (e.code !== 'Space' && e.key !== 'Escape') return;
+  if (!isRunning()) return; // before connecting the panel stays put
+  e.preventDefault();
+  setPanel($('panel').classList.contains('hidden'));
+});
+
+// Cursor: hidden while the panel is hidden; shows on real mouse movement, hides again after 2 s.
+// (Chrome fires synthetic same-position mousemoves when the cursor style changes – ignore those.)
+let lastX = null, lastY = null, cursorT;
+addEventListener('mousemove', e => {
+  if (lastX !== null && Math.abs(e.screenX - lastX) < 3 && Math.abs(e.screenY - lastY) < 3) return;
+  lastX = e.screenX; lastY = e.screenY;
+  if (!$('panel').classList.contains('hidden')) return;
+  document.body.style.cursor = '';
+  clearTimeout(cursorT);
+  cursorT = setTimeout(() => { if ($('panel').classList.contains('hidden')) document.body.style.cursor = 'none'; }, 2000);
+});
 
 if (!navigator.mediaDevices?.getUserMedia) log('Ta przeglądarka nie obsługuje getUserMedia. Użyj Chrome lub Edge.', 'err');
 else refresh().then(() => { if ($('videoSel').value && /★/.test($('videoSel').selectedOptions[0]?.textContent || '')) start(); });
