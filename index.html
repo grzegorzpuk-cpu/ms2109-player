@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MS2109 Player</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 14px system-ui, sans-serif; overflow: hidden; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #panel { position: fixed; top: 12px; left: 12px; right: 12px; max-width: 560px; background: rgba(20,20,20,.88);
+           border: 1px solid #333; border-radius: 10px; padding: 14px 16px; transition: opacity .3s; z-index: 2; }
+  #panel.hidden { opacity: 0; pointer-events: none; }
+  h1 { font-size: 16px; margin: 0 0 10px; }
+  label { display: block; margin: 8px 0 4px; color: #aaa; }
+  select, button { font: inherit; background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 6px 10px; }
+  select { width: 100%; }
+  .row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  button.primary { background: #2f6fde; border-color: #2f6fde; }
+  #log { margin-top: 10px; white-space: pre-wrap; font: 12px ui-monospace, Consolas, monospace; max-height: 30vh; overflow: auto; color: #bbb; }
+  .err { color: #ff7b7b; } .ok { color: #7bd88f; }
+  .hint { color: #888; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+
+<div id="panel">
+  <h1>MS2109 Player</h1>
+
+  <label for="videoSel">Wideo</label>
+  <select id="videoSel"></select>
+
+  <label for="audioSel">Audio</label>
+  <select id="audioSel"></select>
+
+  <label for="modeSel">Tryb obrazu</label>
+  <select id="modeSel">
+    <option value="auto">Auto (1080p 30 → 25 FPS)</option>
+    <option value="1920x1080@60">1080p 60 FPS</option>
+    <option value="1920x1080@30">1080p 30 FPS</option>
+    <option value="1920x1080@25">1080p 25 FPS</option>
+    <option value="1280x720@60">720p 60 FPS</option>
+    <option value="1280x720@30">720p 30 FPS</option>
+  </select>
+
+  <label for="audioMode">Tryb dźwięku</label>
+  <select id="audioMode">
+    <option value="split">Mono z przeplotem → stereo (stare MS2109)</option>
+    <option value="native">Bez konwersji (gdy dźwięk z „Split” brzmi źle)</option>
+    <option value="off">Wyłączony</option>
+  </select>
+
+  <div class="row">
+    <button id="startBtn" class="primary">Start</button>
+    <button id="fsBtn">Pełny ekran</button>
+    <button id="refreshBtn">Odśwież listę</button>
+  </div>
+  <div class="hint">Dwuklik na obrazie = pełny ekran. Panel chowa się sam po 3 s bez ruchu myszy.</div>
+  <div id="log"></div>
+</div>
+
+<script>
+// Known MacroSilicon VID:PID pairs (Chrome appends "(vid:pid)" to device labels)
+const KNOWN_IDS = ['534d:2109', '345f:2109', '345f:2130', '534d:2130'];
+const AUTO_MODES = [
+  { width: 1920, height: 1080, frameRate: 30 },
+  { width: 1920, height: 1080, frameRate: 25 }, // e.g. behind a USB hub
+];
+
+const $ = id => document.getElementById(id);
+const video = $('video');
+let audioCtx = null, streams = [];
+
+function log(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  $('log').appendChild(line);
+  $('log').scrollTop = 1e9;
+  (cls === 'err' ? console.error : console.log)(msg);
+}
+
+const idOf = label => (label.match(/\(([0-9a-f]{4}:[0-9a-f]{4})\)\s*$/i) || [])[1]?.toLowerCase();
+const isKnown = d => KNOWN_IDS.includes(idOf(d.label));
+
+async function ensurePermission() {
+  // Ask separately for camera and microphone: one may be granted while the other is not,
+  // and without camera permission the browser hides (or blanks) all video devices.
+  for (const [kind, constraint, name] of [['videoinput', 'video', 'kamerę'], ['audioinput', 'audio', 'mikrofon']]) {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === kind);
+    if (devs.length && devs.every(d => d.label)) continue;
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ [constraint]: true });
+      s.getTracks().forEach(t => t.stop());
+    } catch (e) {
+      log(`Brak dostępu na ${name}: ${e.name} ${e.message || ''}` +
+          (e.name === 'NotAllowedError' ? '\nKliknij ikonę kłódki/kamery w pasku adresu i zezwól, potem „Odśwież listę”.' :
+           e.name === 'NotReadableError' ? '\nUrządzenie jest zajęte przez inny program (OBS, Kamera, Teams, Discord?).' :
+           e.name === 'NotFoundError' ? '\nPrzeglądarka nie widzi żadnego takiego urządzenia.' : ''), 'err');
+    }
+  }
+}
+
+function fill(sel, list, preferred) {
+  const prev = sel.value;
+  sel.innerHTML = '';
+  for (const d of list) {
+    const o = document.createElement('option');
+    o.value = d.deviceId;
+    o.textContent = (isKnown(d) ? '★ ' : '') + (d.label || d.deviceId);
+    sel.appendChild(o);
+  }
+  if (list.some(d => d.deviceId === prev)) sel.value = prev;
+  else if (preferred) sel.value = preferred.deviceId;
+}
+
+async function refresh() {
+  await ensurePermission();
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  const vids = devs.filter(d => d.kind === 'videoinput' && d.deviceId);
+  const auds = devs.filter(d => d.kind === 'audioinput' && d.deviceId);
+  log(`Urządzenia: ${vids.length} wideo [${vids.map(d => d.label || '?').join(', ')}], ${auds.length} audio [${auds.map(d => d.label || '?').join(', ')}]`);
+  const v = vids.find(isKnown) || vids.find(d => /usb video/i.test(d.label));
+  const a = (v && auds.find(d => d.groupId === v.groupId)) || auds.find(isKnown) || auds.find(d => /usb digital audio/i.test(d.label));
+  fill($('videoSel'), vids, v);
+  fill($('audioSel'), auds, a);
+  if (v) log('Znaleziono kartę: ' + v.label, 'ok');
+  else log('Nie znaleziono karty MS2109 automatycznie – wybierz urządzenie ręcznie z listy.', 'err');
+}
+
+function stopAll() {
+  streams.forEach(s => s.getTracks().forEach(t => t.stop()));
+  streams = [];
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  video.srcObject = null;
+}
+
+async function startVideo(deviceId) {
+  const choice = $('modeSel').value;
+  const modes = choice === 'auto' ? AUTO_MODES : [(() => {
+    const [, w, h, f] = choice.match(/(\d+)x(\d+)@(\d+)/);
+    return { width: +w, height: +h, frameRate: +f };
+  })()];
+  let lastErr;
+  for (const m of modes) {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: deviceId },
+          width: { exact: m.width }, height: { exact: m.height }, frameRate: { exact: m.frameRate },
+        },
+      });
+      log(`Wideo: ${m.width}x${m.height} @ ${m.frameRate} FPS`, 'ok');
+      return s;
+    } catch (e) {
+      lastErr = e;
+      log(`Tryb ${m.width}x${m.height}@${m.frameRate} nie zadziałał: ${e.name} ${e.message || ''}`);
+    }
+  }
+  // last resort: let the browser pick
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
+    const st = s.getVideoTracks()[0].getSettings();
+    log(`Wideo (tryb awaryjny): ${st.width}x${st.height} @ ${st.frameRate} FPS`, 'ok');
+    return s;
+  } catch (e) { throw lastErr || e; }
+}
+
+const SPLIT_WORKLET = `
+class SplitProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs) {
+    const input = inputs[0] && inputs[0][0];
+    const [L, R] = outputs[0];
+    if (!input) return true;
+    // Input is stereo interleaved inside a mono 96 kHz stream: R, L, R, L ...
+    // Output at 96 kHz too, so each sample is duplicated.
+    for (let i = 0; i + 1 < input.length; i += 2) {
+      L[i] = L[i + 1] = input[i + 1];
+      R[i] = R[i + 1] = input[i];
+    }
+    return true;
+  }
+}
+registerProcessor('split-processor', SplitProcessor);`;
+
+async function startAudio(deviceId) {
+  const mode = $('audioMode').value;
+  if (mode === 'off' || !deviceId) return;
+  const base = { deviceId: { exact: deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+
+  if (mode === 'native') {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: { ...base, channelCount: { ideal: 2 } } });
+    streams.push(s);
+    audioCtx = new AudioContext({ latencyHint: 'interactive' });
+    audioCtx.createMediaStreamSource(s).connect(audioCtx.destination);
+    log('Audio: bez konwersji, ' + JSON.stringify(s.getAudioTracks()[0].getSettings().sampleRate) + ' Hz', 'ok');
+    return;
+  }
+
+  const s = await navigator.mediaDevices.getUserMedia({ audio: { ...base, sampleRate: 96000, sampleSize: 16, channelCount: 1 } });
+  streams.push(s);
+  audioCtx = new AudioContext({ sampleRate: 96000, latencyHint: 'interactive' });
+  // blob: URLs are refused when the page is opened from disk (file://, origin "null"),
+  // data: URLs are refused on some setups over http – try both.
+  const blobUrl = URL.createObjectURL(new Blob([SPLIT_WORKLET], { type: 'application/javascript' }));
+  try {
+    await audioCtx.audioWorklet.addModule(blobUrl);
+  } catch {
+    await audioCtx.audioWorklet.addModule('data:application/javascript;charset=utf-8,' + encodeURIComponent(SPLIT_WORKLET));
+  } finally {
+    URL.revokeObjectURL(blobUrl);
+  }
+  const node = new AudioWorkletNode(audioCtx, 'split-processor', {
+    numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+    channelCount: 1, channelCountMode: 'explicit',
+  });
+  audioCtx.createMediaStreamSource(s).connect(node);
+  node.connect(audioCtx.destination);
+  log('Audio: konwersja mono-przeplot → stereo (96 kHz). Jeśli brzmi źle, wybierz „Bez konwersji”.', 'ok');
+}
+
+async function start() {
+  stopAll();
+  const vId = $('videoSel').value, aId = $('audioSel').value;
+  if (!vId) { log('Brak urządzenia wideo na liście – przeglądarka nie udostępniła kamer (zobacz komunikaty wyżej).', 'err'); return; }
+  try {
+    const vs = await startVideo(vId);
+    streams.push(vs);
+    video.srcObject = vs;
+  } catch (e) {
+    log('Nie udało się uruchomić obrazu: ' + e.name + ' ' + (e.message || '') +
+        '\nCzy karty nie używa inny program (OBS, Kamera, Discord)? Spróbuj innego portu USB lub trybu 25 FPS.', 'err');
+    return;
+  }
+  try { await startAudio(aId); }
+  catch (e) { log('Nie udało się uruchomić dźwięku: ' + e.name + ' ' + (e.message || ''), 'err'); }
+}
+
+$('startBtn').onclick = start;
+$('refreshBtn').onclick = refresh;
+const fs = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+$('fsBtn').onclick = fs;
+video.ondblclick = fs;
+navigator.mediaDevices.addEventListener('devicechange', () => { log('Zmiana urządzeń USB – odświeżam listę.'); refresh(); });
+
+// auto-hide panel and cursor
+let hideT;
+function poke() {
+  $('panel').classList.remove('hidden');
+  document.body.style.cursor = '';
+  clearTimeout(hideT);
+  hideT = setTimeout(() => {
+    if (video.srcObject && !$('panel').matches(':hover')) { $('panel').classList.add('hidden'); document.body.style.cursor = 'none'; }
+  }, 3000);
+}
+addEventListener('mousemove', poke);
+addEventListener('keydown', poke);
+
+if (!navigator.mediaDevices?.getUserMedia) log('Ta przeglądarka nie obsługuje getUserMedia. Użyj Chrome lub Edge.', 'err');
+else refresh().then(() => { if ($('videoSel').value && /★/.test($('videoSel').selectedOptions[0]?.textContent || '')) start(); });
+</script>
+</body>
+</html>
